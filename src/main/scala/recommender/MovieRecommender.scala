@@ -1,5 +1,7 @@
 package recommender
 
+import java.time.LocalDateTime
+
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.sql.types._
@@ -82,29 +84,35 @@ object MovieRecommender extends App {
   println(s"Root-mean-square error = $rmse")
   // Root-mean-square error = 0.8425404178067802
 
-  // wrong! compare recommendations, not predictions
-  // https://stackoverflow.com/questions/37975715/rankingmetrics-in-spark-scala
-//  val testRatingCol: Array[Float] = test.select("rating").collect().map(_.getFloat(0))
-//  val testPredictionCol: Array[Float] = predictions.select("prediction").collect().map(_.getFloat(0))
-//  val metrics: RDD[(Array[Float], Array[Float])] = spark.createDataset(List((testPredictionCol, testRatingCol))).rdd
-//  val rm = new RankingMetrics[Float](metrics)
-//  println(s"Mean-average-precision = ${rm.meanAveragePrecision}")
-//  // Mean-average-precision = 6.491003557056679E-7
-//  val k = 5
-//  println(s"Precision at $k = ${rm.precisionAt(k)}")
-
   val nRecommendations = 10
+  model.setColdStartStrategy("drop")
   // Generate top 10 movie recommendations for each user
   val userRecs = model.recommendForAllUsers(nRecommendations)
+  // recommend for all test users to calculate precision
+  val testUsers = test.select(als.getUserCol).distinct()
+  val recommendations = userRecs.join(testUsers, usingColumn = als.getUserCol)
+  //val recommendations = model.recommendForUserSubset(testUsers, nRecommendations)
+  recommendations.show(10, truncate = false)
+  println("Recommendations size " + recommendations.count())
+
+  val groundTruth = test
+    .withColumn("actual", struct("rating", "movieId"))
+    .groupBy($"userId")
+    .agg(slice(sort_array(collect_list($"actual"), asc=false), 1, nRecommendations).as("actual"))
+  groundTruth.show(10, truncate = false)
+  println("Ground truth size " + groundTruth.count())
+
+  val bothRecsAndTruth = groundTruth.join(recommendations, usingColumn = als.getUserCol)
+  bothRecsAndTruth.show(truncate = false)
+  val labels = bothRecsAndTruth.as[RankingHelper].map(r =>
+    RankingLabels(r.recommendations.map(_._1), r.actual.map(_._2)))
+    .as[(Array[Int], Array[Int])]
+  labels.show(truncate = false)
+  val metrics = new RankingMetrics(labels.rdd)
+  println("Precision (at 5) " + metrics.precisionAt(5))
+
   // Generate top 10 user recommendations for each movie
   val movieRecs = model.recommendForAllItems(nRecommendations)
-
-  // recommend for all test users to calculate precision
-//  val testUsers = test.select(als.getUserCol).distinct().limit(10)
-//  model.setColdStartStrategy("drop")
-//  val recommendations = model.recommendForUserSubset(testUsers, nRecommendations)
-//  recommendations.show(10, truncate = false)
-//  println("Reccommendations size " + recommendations.count())
 
   val moviesSchema = StructType(Array(
     StructField("movieId", IntegerType, true),
@@ -122,6 +130,8 @@ object MovieRecommender extends App {
   quickRecommendationCheck(1)
   quickRecommendationCheck(2)
   quickRecommendationCheck(3)
+
+  spark.stop()
 
   def quickRecommendationCheck(userID: Int): Unit = {
 
@@ -141,7 +151,5 @@ object MovieRecommender extends App {
     println(s"Movies recommended to user ${userID}")
     movies.filter($"movieId" isin (recommendedMovieIDs:_*)).show(truncate = false)
   }
-
-  spark.stop()
 
 }
